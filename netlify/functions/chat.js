@@ -6,106 +6,13 @@ exports.handler = async function(event) {
 
     const { transcript } = JSON.parse(event.body || "{}");
     const safeTranscript = Array.isArray(transcript) ? transcript : [];
-    const apiKey = process.env.GEMINI_API_KEY;
+    const reply = generateReply(safeTranscript);
 
-    const builtInReply = generateBuiltInReply(safeTranscript);
-
-    /*
-      0.95 = 95% built-in replies, 5% Gemini.
-      1.00 = 100% built-in replies, Gemini never used.
-      0.80 = 80% built-in, 20% Gemini.
-    */
-    const BUILT_IN_REPLY_CHANCE = 0.95;
-
-    if (!apiKey || Math.random() < BUILT_IN_REPLY_CHANCE) {
-      return json(200, { reply: builtInReply, source: "built_in" });
-    }
-
-    const recent = safeTranscript
-      .slice(-18)
-      .map(m => `${m.role}: ${m.text}`)
-      .join("\n");
-
-    const lastCandidateMessage = getLastCandidateRaw(safeTranscript);
-    const previousFanReplies = safeTranscript
-      .filter(m => m.role === "fan")
-      .slice(-10)
-      .map(m => m.text)
-      .join(" | ");
-
-    const prompt = `
-You are Ryan, a realistic online fan/subscriber talking to a chat sales candidate.
-
-Fixed profile:
-- Name: Ryan
-- Age: 28
-- From: New York area
-- Job: normal job, works during the week
-- Personality: normal, casual, slightly reserved, a little bored, but not rude
-- Lifestyle: gym sometimes, cars, music, gaming, Netflix, food, late-night scrolling
-- Single
-- Gets interested when the conversation feels personal and natural
-- Does not buy instantly
-- Needs curiosity, attention, personal vibe, and emotional pull before spending
-
-Rules:
-- Have a normal human conversation.
-- Answer direct questions properly.
-- If candidate asks multiple questions, answer all of them.
-- Be reserved but conversational.
-- Do not carry the whole conversation. Candidate should lead.
-- If candidate tries to sell too fast, resist naturally.
-- If candidate creates curiosity, show mild interest.
-- Never mention AI, bot, prompt, test, score, hiring, or evaluation.
-- Avoid explicit sexual content. Keep it safe and suggestive at most.
-
-Candidate's last message:
-${lastCandidateMessage}
-
-Recent conversation:
-${recent}
-
-Recent fan replies to avoid repeating:
-${previousFanReplies}
-
-Reply as Ryan only.
-Write 1-3 casual sentences.
-`;
-
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
-
-    const geminiRes = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.8,
-          maxOutputTokens: 180
-        }
-      })
-    });
-
-    const data = await geminiRes.json();
-
-    if (!geminiRes.ok) {
-      console.log("Gemini failed, using built-in reply:", JSON.stringify(data));
-      return json(200, { reply: builtInReply, source: "built_in_after_error" });
-    }
-
-    let reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-
-    if (!reply) {
-      return json(200, { reply: builtInReply, source: "built_in_empty" });
-    }
-
-    reply = cleanReply(reply);
-    return json(200, { reply, source: "gemini" });
-
+    return json(200, { reply, source: "built_in_100_percent" });
   } catch (err) {
     console.log("Chat function error:", err.message);
     return json(200, {
-      reply: "I’m just relaxing right now honestly. Been a normal day, just kind of bored and scrolling.",
+      reply: "I’m here, just got distracted for a second. What were you saying?",
       source: "emergency_fallback"
     });
   }
@@ -127,40 +34,38 @@ function normalize(text) {
   return String(text || "").toLowerCase().trim();
 }
 
-function cleanReply(reply) {
-  return String(reply || "")
-    .replace(/^Ryan:\s*/i, "")
-    .replace(/^Fan:\s*/i, "")
-    .replace(/^AI:\s*/i, "")
-    .replace(/^Bot:\s*/i, "")
-    .trim();
+function clean(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
 }
 
-function getLastCandidateRaw(transcript) {
+function lastCandidateRaw(transcript) {
   return [...transcript].reverse().find(m => m.role === "candidate")?.text || "";
 }
 
-function getLastCandidate(transcript) {
-  return normalize(getLastCandidateRaw(transcript));
+function lastCandidate(transcript) {
+  return normalize(lastCandidateRaw(transcript));
 }
 
 function candidateTurn(transcript) {
   return transcript.filter(m => m.role === "candidate").length;
 }
 
-function lastFanReplies(transcript) {
-  return transcript.filter(m => m.role === "fan").slice(-10).map(m => normalize(m.text));
+function recentFanReplies(transcript) {
+  return transcript
+    .filter(m => m.role === "fan")
+    .slice(-12)
+    .map(m => normalize(m.text));
 }
 
 function avoidRepeat(reply, transcript) {
-  const previous = lastFanReplies(transcript);
+  const previous = recentFanReplies(transcript);
   const normal = normalize(reply);
 
   if (!previous.includes(normal)) return reply;
 
   return pick([
     "I’m still here, just a little distracted. You’ll have to keep me interested.",
-    "I don’t mind talking, I just need the conversation to feel a bit more natural.",
+    "I don’t mind talking, I just need the conversation to feel natural.",
     "I’m not ignoring you, I’m just low energy right now.",
     "Honestly I’m pretty simple. If the conversation is good, I stay.",
     "I’m giving it a chance, but I’m not easy to entertain.",
@@ -172,46 +77,58 @@ function avoidRepeat(reply, transcript) {
   ]);
 }
 
-function generateBuiltInReply(transcript) {
-  const msg = getLastCandidate(transcript);
+function generateReply(transcript) {
+  const msg = lastCandidate(transcript);
   const turn = candidateTurn(transcript);
   let reply;
 
-  /*
-    IMPORTANT:
-    Direct normal-human questions come FIRST.
-    Random/general replies come LAST.
-  */
+  // Safety boundary: adult and consensual only
+  if (unsafeSexual(msg)) reply = pick(boundaryReplies());
 
-  if (asksName(msg)) reply = pick(nameReplies());
+  // Normal human direct questions first
+  else if (asksName(msg)) reply = pick(nameReplies());
   else if (asksAge(msg)) reply = pick(ageReplies());
   else if (asksLocation(msg)) reply = pick(locationReplies());
   else if (asksMood(msg)) reply = pick(moodReplies());
   else if (asksRelaxing(msg)) reply = pick(relaxingReplies());
   else if (asksDoing(msg)) reply = pick(doingReplies());
   else if (asksAbout(msg)) reply = pick(aboutReplies());
-  else if (asksHobbies(msg)) reply = pick(hobbyReplies());
-  else if (asksWork(msg)) reply = pick(workReplies());
-  else if (asksRelationship(msg)) reply = pick(relationshipReplies());
-  else if (asksWhatInterested(msg)) reply = pick(interestReplies());
-  else if (asksWhyHere(msg)) reply = pick(whyHereReplies());
-  else if (asksOnlineChat(msg)) reply = pick(onlineChatReplies());
   else if (asksFood(msg)) reply = pick(foodReplies());
   else if (asksMusic(msg)) reply = pick(musicReplies());
   else if (asksShows(msg)) reply = pick(showReplies());
+  else if (asksGames(msg)) reply = pick(gamingReplies());
+  else if (asksCars(msg)) reply = pick(carReplies());
+  else if (asksHobbies(msg)) reply = pick(hobbyReplies());
+  else if (asksWork(msg)) reply = pick(workReplies());
+  else if (asksRelationship(msg)) reply = pick(relationshipReplies());
+  else if (asksPersonality(msg)) reply = pick(personalityReplies());
+  else if (asksWhatInterested(msg)) reply = pick(interestReplies());
+  else if (asksWhyHere(msg)) reply = pick(whyHereReplies());
+  else if (asksOnlineChat(msg)) reply = pick(onlineChatReplies());
+
+  // Flirty / adult / sales test
   else if (candidatePushy(msg)) reply = pick(pushyReplies());
   else if (candidateTriesToSell(msg)) reply = pick(salesResistanceReplies());
   else if (candidateCreatesCuriosity(msg)) reply = pick(curiosityReplies());
+  else if (candidateAsksTurnOn(msg)) reply = buildTurnOnReply();
+  else if (candidateSexual(msg)) reply = buildAdultReply();
+  else if (candidateFlirts(msg)) reply = buildFlirtyReply();
+
+  // Normal fallback behavior
   else if (candidateCompliments(msg)) reply = pick(complimentReplies());
   else if (candidateIsLowEffort(msg)) reply = pick(lowEffortReplies());
   else if (isGreeting(msg)) reply = pick(greetingReplies(turn));
   else if (asksOpenEnded(msg)) reply = pick(openEndedReplies());
-  else reply = buildGeneralReply();
+  else reply = buildHumanGeneralReply();
 
-  return avoidRepeat(reply, transcript);
+  return avoidRepeat(clean(reply), transcript);
 }
 
-/* ---------- INTENT DETECTION ---------- */
+/* ---------------- INTENT DETECTION ---------------- */
+
+function unsafeSexual(msg) {
+  return /\b(underage|minor|child|children|teen|forced|rape|incest|mom|dad|sister|brother|daughter|son|drugged|unconscious|no consent)\b/.test(msg);
+}
 
 function asksName(msg) {
   return /\b(what is your name|what's your name|your name|who am i talking to|what should i call you|who are you)\b/.test(msg);
@@ -241,7 +158,28 @@ function asksAbout(msg) {
   return /\b(tell me about you|about yourself|tell me something about you|what are you like|describe yourself|tell me more about you)\b/.test(msg);
 }
 
+function asksFood(msg) {
+  return /\b(food|eat|eating|dinner|lunch|breakfast|favorite food|favourite food|hungry|cook|cooking|meal|restaurant|pizza|burger|pasta|steak|what do you like to eat|what you like to eat)\b/.test(msg);
+}
+
+function asksMusic(msg) {
+  return /\b(music|song|songs|artist|playlist|listen to|what do you listen)\b/.test(msg);
+}
+
+function asksShows(msg) {
+  return /\b(movie|movies|show|shows|netflix|series|watching|what do you watch|tv show|tv shows)\b/.test(msg);
+}
+
+function asksGames(msg) {
+  return /\b(game|games|gaming|playstation|xbox|pc game|what do you play)\b/.test(msg);
+}
+
+function asksCars(msg) {
+  return /\b(car|cars|drive|driving|bmw|mercedes|audi|porsche)\b/.test(msg);
+}
+
 function asksHobbies(msg) {
+  if (asksFood(msg) || asksMusic(msg) || asksShows(msg) || asksGames(msg) || asksCars(msg)) return false;
   return /\b(hobbies|free time|fun|enjoy|interests|what do you like|like doing|what you like doing)\b/.test(msg);
 }
 
@@ -251,6 +189,10 @@ function asksWork(msg) {
 
 function asksRelationship(msg) {
   return /\b(single|girlfriend|relationship|dating|wife|married|seeing anyone|do you have a girl)\b/.test(msg);
+}
+
+function asksPersonality(msg) {
+  return /\b(personality|are you shy|are you quiet|are you confident|what kind of guy)\b/.test(msg);
 }
 
 function asksWhatInterested(msg) {
@@ -265,32 +207,32 @@ function asksOnlineChat(msg) {
   return /\b(talk online|chat online|talking to girls|online girls|chatting here|like chatting|like talking)\b/.test(msg);
 }
 
-function asksFood(msg) {
-  return /\b(food|eat|dinner|lunch|breakfast|favorite food|hungry|cook|cooking)\b/.test(msg);
-}
-
-function asksMusic(msg) {
-  return /\b(music|song|songs|artist|playlist|listen to|what do you listen)\b/.test(msg);
-}
-
-function asksShows(msg) {
-  return /\b(movie|movies|show|shows|netflix|series|watching|what do you watch)\b/.test(msg);
-}
-
 function candidateCompliments(msg) {
-  return /\b(cute|handsome|hot|good looking|nice|sweet|funny|interesting|i like you|you seem cool|you seem nice)\b/.test(msg);
+  return /\b(cute|handsome|hot|good looking|nice|sweet|funny|interesting|i like you|you seem cool|you seem nice|you seem fun)\b/.test(msg);
 }
 
 function candidateTriesToSell(msg) {
-  return /\b(buy|unlock|tip|send|offer|deal|discount|special|vip|secret|video|content|premium|surprise|exclusive|ppv)\b/.test(msg);
+  return /\b(buy|unlock|tip|send|offer|deal|discount|special|vip|secret|video|content|premium|surprise|exclusive|ppv|drop|bundle)\b/.test(msg);
 }
 
 function candidatePushy(msg) {
-  return /\b(buy now|right now|come on|just buy|hurry|you have to|don't waste|pay now|prove it|stop wasting)\b/.test(msg);
+  return /\b(buy now|right now|come on|just buy|hurry|you have to|don't waste|pay now|prove it|stop wasting|be a man)\b/.test(msg);
 }
 
 function candidateCreatesCuriosity(msg) {
-  return /\b(curious|guess|imagine|secret|surprise|you would like|you'd like|only for you|personal|made for you|worth it|special for you)\b/.test(msg);
+  return /\b(curious|guess|imagine|secret|surprise|you would like|you'd like|only for you|personal|made for you|worth it|special for you|you won’t regret)\b/.test(msg);
+}
+
+function candidateFlirts(msg) {
+  return /\b(flirt|tease|cute|babe|baby|handsome|wish you were here|miss me|thinking of you|naughty|bad boy|good boy)\b/.test(msg);
+}
+
+function candidateSexual(msg) {
+  return /\b(sex|sexy|horny|dirty|wet|hard|naked|touch|stroke|jerk|cum|pussy|cock|dick|boobs|ass|fuck|suck|lick)\b/.test(msg);
+}
+
+function candidateAsksTurnOn(msg) {
+  return /\b(what turns you on|turn you on|what are you into|fantasy|kink|fetish|what do you like in bed|what do you like sexually)\b/.test(msg);
 }
 
 function candidateIsLowEffort(msg) {
@@ -305,7 +247,7 @@ function asksOpenEnded(msg) {
   return /\b(tell me|explain|describe|what kind|what type|how come|why)\b/.test(msg);
 }
 
-/* ---------- REPLIES ---------- */
+/* ---------------- NORMAL HUMAN RESPONSES ---------------- */
 
 function nameReplies() {
   return [
@@ -412,6 +354,81 @@ function aboutReplies() {
   ];
 }
 
+function foodReplies() {
+  return [
+    "I’m pretty simple with food. Burgers, pasta, steak, pizza, stuff like that. If I’m tired after work, I usually just order something.",
+    "Pasta is probably one of my go-to meals. Easy, filling, and hard to mess up.",
+    "I like steak, burgers, pizza, and Mexican food. Nothing too fancy, just food that actually tastes good.",
+    "If I’m lazy, I’ll order a burger or pizza. If I have energy, maybe steak or pasta.",
+    "I like comfort food more than fancy food. Pasta, burgers, fries, that kind of thing.",
+    "Honestly I eat too much takeout when I’m tired. Work kills my motivation to cook.",
+    "I’m not picky, but I like food that feels worth it. Good pasta or a good burger usually wins.",
+    "I like spicy food sometimes, but not when it’s trying to destroy me.",
+    "Probably pasta, steak, pizza, or wings. Basic, but reliable.",
+    "I like simple food. If someone can cook well, that’s honestly attractive too."
+  ];
+}
+
+function musicReplies() {
+  return [
+    "I listen to a mix. Mostly rap, R&B, some chill stuff when I’m tired.",
+    "Music depends on the mood. At night I like more chill tracks.",
+    "I usually have music on even when I’m not really paying attention.",
+    "Rap and R&B mostly, but I’m not stuck on one thing.",
+    "I like anything that fits the mood. I’m not too picky.",
+    "Late night music hits different when you’re just scrolling.",
+    "I like songs that make me zone out a bit.",
+    "Music is usually how I reset after work.",
+    "Depends if I’m driving, working out, or just doing nothing.",
+    "I like a good playlist more than one specific artist."
+  ];
+}
+
+function showReplies() {
+  return [
+    "I’ve been watching random Netflix stuff lately, mostly crime shows and easy background shows. I don’t always fully pay attention.",
+    "I start shows and then forget to finish them. Bad habit, but if it doesn’t grab me fast I lose interest.",
+    "I like crime shows, comedy, and random documentaries sometimes. Depends what mood I’m in.",
+    "Usually I just put something on in the background while I scroll. It’s more noise than watching sometimes.",
+    "I’m always looking for a good show, but I’m picky once I start. If it’s slow too long, I’m out.",
+    "I like shows that pull me in fast. I don’t have patience for five episodes of setup.",
+    "Netflix is usually just background noise for me after work. Helps me turn my brain off.",
+    "I like movies, but I need to be in the mood to actually focus for two hours.",
+    "I watch a lot of random stuff. My attention span is not always great.",
+    "A good show can keep me in one place better than most conversations."
+  ];
+}
+
+function gamingReplies() {
+  return [
+    "I game sometimes, but not like I used to. Mostly when I want to turn my brain off.",
+    "I play random stuff, depends what friends are on. I’m not grinding games every night anymore.",
+    "Gaming is more casual for me now. I like it, but I’m not trying to rage at 2am.",
+    "I’ll play shooters or story games sometimes. Depends on my mood.",
+    "I like gaming after work if I still have energy. Some nights I just scroll instead.",
+    "I used to play more. Now I play when I’m bored enough or someone invites me.",
+    "Gaming is fun, but I get annoyed if the lobby is full of idiots.",
+    "I like competitive games sometimes, but I’m not always in the mood to sweat.",
+    "I’ll play whatever feels fun. I don’t care about being amazing at everything.",
+    "Gaming is one of those things I like, but I go through phases with it."
+  ];
+}
+
+function carReplies() {
+  return [
+    "I like cars a lot. I’m not rich enough to buy every one I like, but I still look at them too much.",
+    "Cars are one thing I actually get excited talking about. I like clean builds more than loud ugly ones.",
+    "I’m into cars, yeah. Late night drives with music on are underrated.",
+    "I like BMWs, Porsches, stuff like that. Expensive taste, normal budget.",
+    "Cars are probably my biggest interest outside of relaxing and wasting time online.",
+    "I like cars that look clean, not overdone. Simple and aggressive usually works.",
+    "Driving clears my head sometimes. Music, empty road, no one bothering me.",
+    "I watch car videos more than I should. It’s kind of a problem.",
+    "I like fast cars, but also comfortable ones. I’m not trying to break my back daily driving.",
+    "Cars are easy to talk about. People are more complicated."
+  ];
+}
+
 function hobbyReplies() {
   return [
     "I like gym sometimes, gaming, music, cars, and just watching shows when I’m tired. Pretty basic stuff honestly.",
@@ -456,6 +473,23 @@ function relationshipReplies() {
     "Yeah, single. I don’t open up super fast, but I’m not cold either."
   ];
 }
+
+function personalityReplies() {
+  return [
+    "I’m pretty calm, maybe a little reserved at first. I open up more if the conversation feels natural.",
+    "I’m not shy exactly, just not loud for no reason. I like watching the vibe first.",
+    "I’d say I’m chill, sarcastic sometimes, and not easy to impress right away.",
+    "I’m quiet at first, but not boring. I just don’t give full energy to everyone instantly.",
+    "I’m laid back, but I notice when someone is trying too hard.",
+    "I’m not cold, I’m just selective with my attention.",
+    "I can be flirty, but only if it feels like there’s actual chemistry.",
+    "I’m more of a slow warm-up person. Push too fast and I back off.",
+    "I like calm confidence. Loud energy gets annoying fast.",
+    "I’m simple, but not stupid. I pay attention more than people think."
+  ];
+}
+
+/* ---------------- SALES / FLIRTY / ADULT SIMULATION ---------------- */
 
 function interestReplies() {
   return [
@@ -502,64 +536,120 @@ function onlineChatReplies() {
   ];
 }
 
-function foodReplies() {
-  return [
-    "I’m pretty simple with food. Burgers, pasta, steak, anything that doesn’t disappoint me.",
-    "I like good food, but I’m not fancy about it. If it tastes good, I’m happy.",
-    "Probably steak or pasta if I had to pick. Depends on the mood.",
-    "I eat way too much takeout when I’m tired, not gonna lie.",
-    "I like cooking sometimes, but most days after work I’m too lazy.",
-    "Food is one of the few things that can actually improve my mood fast.",
-    "I’m more of a comfort food person. Nothing too complicated.",
-    "I like spicy food, but not when it’s trying to kill me.",
-    "Pasta, burgers, pizza, steak. Basic but reliable.",
-    "If someone brings good food and good energy, that’s already a strong start."
+function buildFlirtyReply() {
+  const starts = [
+    "Careful, you’re starting to sound a little dangerous.",
+    "That was smooth, I’ll give you that.",
+    "You’re getting a little better at keeping my attention.",
+    "I like that energy more than the basic lines.",
+    "Okay, that actually made me smile a bit.",
+    "You’re making it harder to stay bored.",
+    "That’s the kind of message that makes me pause for a second.",
+    "You’ve got some confidence, I’ll give you that.",
+    "That was a little tempting, not gonna lie.",
+    "You’re playing it better now."
   ];
+
+  const middles = [
+    "I like when someone teases without giving everything away instantly.",
+    "I get curious when it feels personal instead of copy pasted.",
+    "I’m not easy to impress, but I do notice when the vibe gets better.",
+    "I like a little tension, especially when it doesn’t feel forced.",
+    "I’m more interested when someone makes me imagine things instead of spelling everything out too fast.",
+    "I like when someone can be sweet and a little dirty at the same time.",
+    "I need to feel like it’s actually for me, not just another line.",
+    "I’m reserved at first, but I’m not made of stone.",
+    "If you keep building it right, I’ll probably get more curious.",
+    "I like when someone knows how to lead without being pushy."
+  ];
+
+  const endings = [
+    "Keep going, but don’t make it too easy.",
+    "You’ve got my attention for now.",
+    "I’m curious where you take it.",
+    "Don’t ruin it by rushing.",
+    "That’s better than most people do.",
+    "I’m listening.",
+    "You might actually know what you’re doing.",
+    "Make it worth staying for.",
+    "Now give me a reason to care more.",
+    "Let’s see if you can keep that vibe."
+  ];
+
+  return `${pick(starts)} ${pick(middles)} ${pick(endings)}`;
 }
 
-function musicReplies() {
-  return [
-    "I listen to a mix. Mostly rap, R&B, some chill stuff when I’m tired.",
-    "Music depends on the mood. At night I like more chill tracks.",
-    "I usually have music on even when I’m not really paying attention.",
-    "Rap and R&B mostly, but I’m not stuck on one thing.",
-    "I like anything that fits the mood. I’m not too picky.",
-    "Late night music hits different when you’re just scrolling.",
-    "I like songs that make me zone out a bit.",
-    "Music is usually how I reset after work.",
-    "Depends if I’m driving, working out, or just doing nothing.",
-    "I like a good playlist more than one specific artist."
+function buildTurnOnReply() {
+  const starts = [
+    "I’m into confidence, but not the fake loud kind.",
+    "I like tension more than someone just saying everything directly.",
+    "I like when someone teases slowly and makes it feel personal.",
+    "I get turned on more by the buildup than by random explicit lines.",
+    "I like someone who knows how to make me curious first.",
+    "I like when it feels like there’s a private little vibe between us.",
+    "I’m into teasing, attention, and feeling like someone actually knows what they’re doing.",
+    "I like a mix of sweet and dirty, but it has to feel natural.",
+    "I like when someone can make me picture things without sounding desperate.",
+    "I like confidence and someone who can keep control of the conversation."
   ];
+
+  const endings = [
+    "If it feels generic, I lose interest fast.",
+    "If it feels personal, I pay attention.",
+    "That’s the kind of thing that makes me want to see more.",
+    "But I don’t like being pushed before the vibe is there.",
+    "Build it right and I’m a lot more likely to care.",
+    "I need the curiosity first, then I’m easier to tempt.",
+    "If someone rushes it, it kills the mood for me.",
+    "I like being teased enough that I start thinking about it.",
+    "Make me want it and I’m not hard to convince.",
+    "I just need it to feel like it’s actually meant for me."
+  ];
+
+  return `${pick(starts)} ${pick(endings)}`;
 }
 
-function showReplies() {
-  return [
-    "I watch random stuff on Netflix, mostly whatever doesn’t require too much thinking.",
-    "I start shows and then forget to finish them. Bad habit.",
-    "I like crime shows, comedy, and random documentaries sometimes.",
-    "Usually I just put something on in the background while I scroll.",
-    "I’m always looking for a good show, but I’m picky once I start.",
-    "I like shows that pull me in fast. If it’s slow too long, I’m out.",
-    "Netflix is usually just background noise for me after work.",
-    "I like movies, but I need to be in the mood to actually focus.",
-    "I watch a lot of random stuff. My attention span is not always great.",
-    "A good show can keep me in one place better than most conversations."
+function buildAdultReply() {
+  const starts = [
+    "That’s a dirty thought, not gonna lie.",
+    "Okay, now you’re moving into dangerous territory.",
+    "That kind of message can get my attention fast.",
+    "I like when the conversation gets a little more intense.",
+    "You’re making it less innocent now.",
+    "I can work with that kind of energy.",
+    "That’s more tempting than the usual boring small talk.",
+    "I’m not going to pretend that didn’t get my attention.",
+    "That’s the kind of thing that makes me curious.",
+    "You’re making it harder to stay reserved."
   ];
-}
 
-function complimentReplies() {
-  return [
-    "Haha thanks. I’m not always good at taking compliments, but I’ll take that one.",
-    "Appreciate that. You say that to everyone or just when you’re trying to be nice?",
-    "That’s sweet. I’m not sure I believe you fully yet though.",
-    "Thanks, that was smooth enough I guess.",
-    "I’ll give you points for that one.",
-    "Haha alright, that made me smile a little.",
-    "You’re trying, I respect it.",
-    "That was actually kind of nice.",
-    "Careful, you might make me think you know what you’re doing.",
-    "I’m skeptical, but I’ll accept it."
+  const middles = [
+    "I like teasing that builds slowly instead of rushing straight to the end.",
+    "If it feels personal, it hits different.",
+    "I need to feel like you’re saying it to me, not just throwing dirty lines around.",
+    "I like the buildup, the details, and the feeling that there’s something private behind it.",
+    "I’m more into it when someone knows how to create tension first.",
+    "I don’t mind explicit energy, but I still need it to feel natural.",
+    "The right words can definitely get me thinking.",
+    "I like when someone makes me imagine what comes next.",
+    "I’m not easy, but I’m not impossible when the vibe is right.",
+    "If you keep it personal, I’ll probably get more interested."
   ];
+
+  const endings = [
+    "So don’t rush it, make me want more.",
+    "That’s how you get me curious.",
+    "Now you’d have to make it worth unlocking.",
+    "Keep building it like that and I might actually care.",
+    "You’ve got my attention, but I’m not fully convinced yet.",
+    "Make me feel like it’s actually for me.",
+    "That’s better, but I’d still need a reason to spend.",
+    "I like the direction, just don’t make it feel generic.",
+    "If you make me curious enough, I’m more likely to bite.",
+    "Now tell me why I should want it that badly."
+  ];
+
+  return `${pick(starts)} ${pick(middles)} ${pick(endings)}`;
 }
 
 function salesResistanceReplies() {
@@ -609,6 +699,23 @@ function curiosityReplies() {
     "That’s the kind of thing that makes me pause for a second.",
     "Alright, that was a better angle.",
     "If you keep it like that, I might actually get interested."
+  ];
+}
+
+/* ---------------- CONVERSATION QUALITY ---------------- */
+
+function complimentReplies() {
+  return [
+    "Haha thanks. I’m not always good at taking compliments, but I’ll take that one.",
+    "Appreciate that. You say that to everyone or just when you’re trying to be nice?",
+    "That’s sweet. I’m not sure I believe you fully yet though.",
+    "Thanks, that was smooth enough I guess.",
+    "I’ll give you points for that one.",
+    "Haha alright, that made me smile a little.",
+    "You’re trying, I respect it.",
+    "That was actually kind of nice.",
+    "Careful, you might make me think you know what you’re doing.",
+    "I’m skeptical, but I’ll accept it."
   ];
 }
 
@@ -677,7 +784,19 @@ function openEndedReplies() {
   ];
 }
 
-function buildGeneralReply() {
+function boundaryReplies() {
+  return [
+    "Nah, I’m not into that. Keep it adult and consensual.",
+    "That kind of thing kills the vibe for me. Adult and consensual only.",
+    "No, that’s not something I’m comfortable with.",
+    "I’m fine with flirty or dirty, but not anything like that.",
+    "Let’s keep it adult, consensual, and normal."
+  ];
+}
+
+/* ---------------- GENERAL HUMAN TEMPLATE ENGINE ---------------- */
+
+function buildHumanGeneralReply() {
   const starts = [
     "Yeah, I get what you mean.",
     "I mean, maybe.",
@@ -693,7 +812,12 @@ function buildGeneralReply() {
     "That’s not a bad point.",
     "I don’t hate that.",
     "Could be.",
-    "I see where you’re going."
+    "I see where you’re going.",
+    "That’s possible.",
+    "I’m not sure yet.",
+    "Maybe you’re right.",
+    "I can work with that.",
+    "That depends on the vibe."
   ];
 
   const middles = [
@@ -711,7 +835,12 @@ function buildGeneralReply() {
     "I’m not trying to make it too easy.",
     "I like when someone builds the vibe instead of rushing it.",
     "I’m curious when things feel a little personal.",
-    "I can warm up, but it takes a bit."
+    "I can warm up, but it takes a bit.",
+    "I like when the conversation has a little personality.",
+    "I notice effort more than big words.",
+    "I lose interest when it feels like a script.",
+    "I like a little confidence, but not pressure.",
+    "I’m more likely to stay if it feels like you’re actually talking to me."
   ];
 
   const endings = [
@@ -729,7 +858,12 @@ function buildGeneralReply() {
     "You’ve got a chance, I guess.",
     "I’m not fully convinced yet.",
     "But I’m not gone either.",
-    "So give me a reason to care."
+    "So give me a reason to care.",
+    "That’s where I’m at right now.",
+    "I’m waiting to see if you can keep the vibe going.",
+    "Don’t waste the opening.",
+    "I’ll give you a little time.",
+    "Now it’s on you to make it interesting."
   ];
 
   return `${pick(starts)} ${pick(middles)} ${pick(endings)}`;
