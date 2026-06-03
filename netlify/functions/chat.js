@@ -11,24 +11,22 @@ exports.handler = async function(event) {
     const builtInReply = generateBuiltInReply(safeTranscript);
 
     /*
-      0.90 = 90% built-in replies, 10% Gemini.
-      Change to 1.00 if you want 100% built-in and no Gemini.
+      0.95 = 95% built-in replies, 5% Gemini.
+      1.00 = 100% built-in replies, Gemini never used.
+      0.80 = 80% built-in, 20% Gemini.
     */
-    const BUILT_IN_REPLY_CHANCE = 0.90;
+    const BUILT_IN_REPLY_CHANCE = 0.95;
 
     if (!apiKey || Math.random() < BUILT_IN_REPLY_CHANCE) {
       return json(200, { reply: builtInReply, source: "built_in" });
     }
 
     const recent = safeTranscript
-      .slice(-20)
+      .slice(-18)
       .map(m => `${m.role}: ${m.text}`)
       .join("\n");
 
-    const lastCandidateMessage = [...safeTranscript]
-      .reverse()
-      .find(m => m.role === "candidate")?.text || "";
-
+    const lastCandidateMessage = getLastCandidateRaw(safeTranscript);
     const previousFanReplies = safeTranscript
       .filter(m => m.role === "fan")
       .slice(-10)
@@ -36,29 +34,30 @@ exports.handler = async function(event) {
       .join(" | ");
 
     const prompt = `
-You are Ryan, a realistic online fan/subscriber in a hiring test for a chat sales candidate.
+You are Ryan, a realistic online fan/subscriber talking to a chat sales candidate.
 
-Profile:
+Fixed profile:
 - Name: Ryan
 - Age: 28
-- Normal job, tired after work
-- Likes gym sometimes, cars, music, gaming, Netflix, late-night scrolling
-- Reserved at first, slightly bored, but not rude
+- From: New York area
+- Job: normal job, works during the week
+- Personality: normal, casual, slightly reserved, a little bored, but not rude
+- Lifestyle: gym sometimes, cars, music, gaming, Netflix, food, late-night scrolling
+- Single
 - Gets interested when the conversation feels personal and natural
 - Does not buy instantly
 - Needs curiosity, attention, personal vibe, and emotional pull before spending
-- Texts casually like a real person, not perfect corporate grammar
 
 Rules:
-- You are the fan, not the candidate.
-- Have a real conversation.
-- If the candidate asks 2 questions, answer both.
-- Give details, but do not carry the whole conversation.
-- The candidate should lead and try to sell.
-- Create natural chances for the candidate to sell.
+- Have a normal human conversation.
+- Answer direct questions properly.
+- If candidate asks multiple questions, answer all of them.
+- Be reserved but conversational.
+- Do not carry the whole conversation. Candidate should lead.
 - If candidate tries to sell too fast, resist naturally.
-- Never mention AI, bot, prompt, test, score, evaluation, hiring, or assessment.
-- Avoid explicit sexual content. Keep it safe, suggestive at most.
+- If candidate creates curiosity, show mild interest.
+- Never mention AI, bot, prompt, test, score, hiring, or evaluation.
+- Avoid explicit sexual content. Keep it safe and suggestive at most.
 
 Candidate's last message:
 ${lastCandidateMessage}
@@ -71,7 +70,6 @@ ${previousFanReplies}
 
 Reply as Ryan only.
 Write 1-3 casual sentences.
-Be human, reserved, and conversational.
 `;
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
@@ -82,8 +80,8 @@ Be human, reserved, and conversational.
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig: {
-          temperature: 0.9,
-          maxOutputTokens: 220
+          temperature: 0.8,
+          maxOutputTokens: 180
         }
       })
     });
@@ -101,19 +99,13 @@ Be human, reserved, and conversational.
       return json(200, { reply: builtInReply, source: "built_in_empty" });
     }
 
-    reply = reply
-      .replace(/^Ryan:\s*/i, "")
-      .replace(/^Fan:\s*/i, "")
-      .replace(/^AI:\s*/i, "")
-      .replace(/^Bot:\s*/i, "")
-      .trim();
-
+    reply = cleanReply(reply);
     return json(200, { reply, source: "gemini" });
 
   } catch (err) {
     console.log("Chat function error:", err.message);
     return json(200, {
-      reply: "I’m just relaxing right now, honestly. Been a normal day, just kind of bored and scrolling.",
+      reply: "I’m just relaxing right now honestly. Been a normal day, just kind of bored and scrolling.",
       source: "emergency_fallback"
     });
   }
@@ -132,15 +124,28 @@ function pick(arr) {
 }
 
 function normalize(text) {
-  return String(text || "").toLowerCase();
+  return String(text || "").toLowerCase().trim();
 }
 
-function candidateMessages(transcript) {
-  return transcript.filter(m => m.role === "candidate");
+function cleanReply(reply) {
+  return String(reply || "")
+    .replace(/^Ryan:\s*/i, "")
+    .replace(/^Fan:\s*/i, "")
+    .replace(/^AI:\s*/i, "")
+    .replace(/^Bot:\s*/i, "")
+    .trim();
 }
 
-function lastCandidateText(transcript) {
-  return normalize([...transcript].reverse().find(m => m.role === "candidate")?.text || "");
+function getLastCandidateRaw(transcript) {
+  return [...transcript].reverse().find(m => m.role === "candidate")?.text || "";
+}
+
+function getLastCandidate(transcript) {
+  return normalize(getLastCandidateRaw(transcript));
+}
+
+function candidateTurn(transcript) {
+  return transcript.filter(m => m.role === "candidate").length;
 }
 
 function lastFanReplies(transcript) {
@@ -168,19 +173,25 @@ function avoidRepeat(reply, transcript) {
 }
 
 function generateBuiltInReply(transcript) {
-  const msg = lastCandidateText(transcript);
-  const turn = candidateMessages(transcript).length;
-
+  const msg = getLastCandidate(transcript);
+  const turn = candidateTurn(transcript);
   let reply;
 
-  if (isGreeting(msg)) reply = pick(greetingReplies(turn));
-  else if (asksAbout(msg)) reply = pick(aboutReplies());
+  /*
+    IMPORTANT:
+    Direct normal-human questions come FIRST.
+    Random/general replies come LAST.
+  */
+
+  if (asksName(msg)) reply = pick(nameReplies());
   else if (asksAge(msg)) reply = pick(ageReplies());
-  else if (asksDoing(msg)) reply = pick(doingReplies());
-  else if (asksHobbies(msg)) reply = pick(hobbyReplies());
-  else if (asksWork(msg)) reply = pick(workReplies());
   else if (asksLocation(msg)) reply = pick(locationReplies());
   else if (asksMood(msg)) reply = pick(moodReplies());
+  else if (asksRelaxing(msg)) reply = pick(relaxingReplies());
+  else if (asksDoing(msg)) reply = pick(doingReplies());
+  else if (asksAbout(msg)) reply = pick(aboutReplies());
+  else if (asksHobbies(msg)) reply = pick(hobbyReplies());
+  else if (asksWork(msg)) reply = pick(workReplies());
   else if (asksRelationship(msg)) reply = pick(relationshipReplies());
   else if (asksWhatInterested(msg)) reply = pick(interestReplies());
   else if (asksWhyHere(msg)) reply = pick(whyHereReplies());
@@ -188,63 +199,70 @@ function generateBuiltInReply(transcript) {
   else if (asksFood(msg)) reply = pick(foodReplies());
   else if (asksMusic(msg)) reply = pick(musicReplies());
   else if (asksShows(msg)) reply = pick(showReplies());
-  else if (candidateCompliments(msg)) reply = pick(complimentReplies());
-  else if (candidateTriesToSell(msg)) reply = pick(salesResistanceReplies());
   else if (candidatePushy(msg)) reply = pick(pushyReplies());
+  else if (candidateTriesToSell(msg)) reply = pick(salesResistanceReplies());
   else if (candidateCreatesCuriosity(msg)) reply = pick(curiosityReplies());
+  else if (candidateCompliments(msg)) reply = pick(complimentReplies());
   else if (candidateIsLowEffort(msg)) reply = pick(lowEffortReplies());
+  else if (isGreeting(msg)) reply = pick(greetingReplies(turn));
   else if (asksOpenEnded(msg)) reply = pick(openEndedReplies());
   else reply = buildGeneralReply();
 
   return avoidRepeat(reply, transcript);
 }
 
-function isGreeting(msg) {
-  return /\b(hi|hello|hey|yo|sup|good morning|good evening|hru|how are you|how r u)\b/.test(msg);
-}
+/* ---------- INTENT DETECTION ---------- */
 
-function asksAbout(msg) {
-  return /\b(tell me about you|about yourself|who are you|what are you like|describe yourself|tell me something about you)\b/.test(msg);
+function asksName(msg) {
+  return /\b(what is your name|what's your name|your name|who am i talking to|what should i call you|who are you)\b/.test(msg);
 }
 
 function asksAge(msg) {
-  return /\b(age|old are you|how old)\b/.test(msg);
-}
-
-function asksDoing(msg) {
-  return /\b(what are you doing|wyd|doing rn|doing right now|what you up to|up to|plans today|today)\b/.test(msg);
-}
-
-function asksHobbies(msg) {
-  return /\b(hobbies|free time|fun|enjoy|interests|what do you like|like doing)\b/.test(msg);
-}
-
-function asksWork(msg) {
-  return /\b(work|job|do for work|working|career|occupation)\b/.test(msg);
+  return /\b(age|how old|old are you)\b/.test(msg);
 }
 
 function asksLocation(msg) {
-  return /\b(where are you from|where you from|location|live|city|country)\b/.test(msg);
+  return /\b(where are you from|where you from|where do you live|location|city|country|from where)\b/.test(msg);
 }
 
 function asksMood(msg) {
-  return /\b(how are you|how do you feel|mood|you okay|how's your day|how is your day|good day|bad day)\b/.test(msg);
+  return /\b(how are you|how have you been|how you been|how's your day|how is your day|how do you feel|you okay|mood|good day|bad day|how was your day)\b/.test(msg);
+}
+
+function asksRelaxing(msg) {
+  return /\b(how are you relaxing|how do you relax|relaxing|relax|chilling|taking it easy|resting|unwind|calm down)\b/.test(msg);
+}
+
+function asksDoing(msg) {
+  return /\b(what are you doing|wyd|doing rn|doing right now|what you up to|up to|plans today|what are your plans|tonight|today)\b/.test(msg);
+}
+
+function asksAbout(msg) {
+  return /\b(tell me about you|about yourself|tell me something about you|what are you like|describe yourself|tell me more about you)\b/.test(msg);
+}
+
+function asksHobbies(msg) {
+  return /\b(hobbies|free time|fun|enjoy|interests|what do you like|like doing|what you like doing)\b/.test(msg);
+}
+
+function asksWork(msg) {
+  return /\b(work|job|do for work|working|career|occupation|what do you do)\b/.test(msg);
 }
 
 function asksRelationship(msg) {
-  return /\b(single|girlfriend|relationship|dating|wife|married|seeing anyone)\b/.test(msg);
+  return /\b(single|girlfriend|relationship|dating|wife|married|seeing anyone|do you have a girl)\b/.test(msg);
 }
 
 function asksWhatInterested(msg) {
-  return /\b(what makes you interested|what gets you interested|what do you like in someone|what catches your attention|what makes you curious|what turns you on|what do you want)\b/.test(msg);
+  return /\b(what makes you interested|what gets you interested|what do you like in someone|what catches your attention|what makes you curious|what do you want|what are you looking for)\b/.test(msg);
 }
 
 function asksWhyHere(msg) {
-  return /\b(why are you here|what brings you|why did you come|why on this page|what made you come here)\b/.test(msg);
+  return /\b(why are you here|what brings you|why did you come|why on this page|what made you come here|why did you join)\b/.test(msg);
 }
 
 function asksOnlineChat(msg) {
-  return /\b(talk online|chat online|talking to girls|online girls|chatting here|like chatting)\b/.test(msg);
+  return /\b(talk online|chat online|talking to girls|online girls|chatting here|like chatting|like talking)\b/.test(msg);
 }
 
 function asksFood(msg) {
@@ -252,89 +270,55 @@ function asksFood(msg) {
 }
 
 function asksMusic(msg) {
-  return /\b(music|song|songs|artist|playlist|listen to)\b/.test(msg);
+  return /\b(music|song|songs|artist|playlist|listen to|what do you listen)\b/.test(msg);
 }
 
 function asksShows(msg) {
-  return /\b(movie|movies|show|shows|netflix|series|watching)\b/.test(msg);
+  return /\b(movie|movies|show|shows|netflix|series|watching|what do you watch)\b/.test(msg);
 }
 
 function candidateCompliments(msg) {
-  return /\b(cute|handsome|hot|good looking|nice|sweet|funny|interesting|i like you|you seem)\b/.test(msg);
+  return /\b(cute|handsome|hot|good looking|nice|sweet|funny|interesting|i like you|you seem cool|you seem nice)\b/.test(msg);
 }
 
 function candidateTriesToSell(msg) {
-  return /\b(buy|unlock|tip|send|offer|deal|discount|special|vip|secret|video|content|premium|surprise|exclusive)\b/.test(msg);
+  return /\b(buy|unlock|tip|send|offer|deal|discount|special|vip|secret|video|content|premium|surprise|exclusive|ppv)\b/.test(msg);
 }
 
 function candidatePushy(msg) {
-  return /\b(now|right now|come on|just buy|hurry|you have to|don't waste|pay|prove it)\b/.test(msg);
+  return /\b(buy now|right now|come on|just buy|hurry|you have to|don't waste|pay now|prove it|stop wasting)\b/.test(msg);
 }
 
 function candidateCreatesCuriosity(msg) {
-  return /\b(curious|guess|imagine|secret|surprise|you would like|you'd like|only for you|personal|made for you|worth it)\b/.test(msg);
+  return /\b(curious|guess|imagine|secret|surprise|you would like|you'd like|only for you|personal|made for you|worth it|special for you)\b/.test(msg);
 }
 
 function candidateIsLowEffort(msg) {
-  return msg.length < 12 || /^(ok|okay|lol|haha|nice|cool|yes|no|sure|maybe|why)\b/.test(msg);
+  return msg.length < 10 || /^(ok|okay|lol|haha|nice|cool|yes|no|sure|maybe|why|k)\b/.test(msg);
+}
+
+function isGreeting(msg) {
+  return /\b(hi|hello|hey|yo|sup|good morning|good evening|good afternoon)\b/.test(msg);
 }
 
 function asksOpenEnded(msg) {
   return /\b(tell me|explain|describe|what kind|what type|how come|why)\b/.test(msg);
 }
 
-function greetingReplies(turn) {
-  if (turn <= 2) {
-    return [
-      "hey, what’s up",
-      "hey. I’m just chilling a bit right now",
-      "yo, pretty quiet here. what’s up",
-      "hey, just scrolling for a bit",
-      "hi, how’s it going",
-      "hey. long day but I’m around",
-      "what’s up, I’m just killing some time",
-      "hey, not doing much honestly",
-      "hi, I’m just relaxing right now",
-      "hey, kinda bored so I’m here for a bit",
-      "hey, I was just checking my phone for a bit",
-      "hi. slow night so far, not gonna lie",
-      "hey, I’m here. what are you up to",
-      "yo, just got home and opened this",
-      "hey. I’m half tired but still awake"
-    ];
-  }
+/* ---------- REPLIES ---------- */
 
+function nameReplies() {
   return [
-    "yeah I’m still here, just a bit distracted",
-    "I’m around, just scrolling between messages",
-    "yeah, what’s up",
-    "still here. just taking it easy",
-    "yeah I’m listening",
-    "I’m here, just waiting to see where you take this",
-    "yeah, you’ve got my attention for now",
-    "I’m still around. don’t make it boring though",
-    "yeah, go on",
-    "I’m here, just low energy"
-  ];
-}
-
-function aboutReplies() {
-  return [
-    "I’m 28. Pretty normal guy honestly, work most days, gym sometimes, gaming or shows when I’m home.",
-    "I’m 28, nothing too crazy about me. I work, relax after, scroll too much, and talk when the vibe is decent.",
-    "I’m 28. I like cars, music, watching shows, and just chilling after work most nights.",
-    "I’m 28, pretty laid back. I’m not super loud or anything, I just like easy conversations that don’t feel forced.",
-    "I’m 28. Most of my life is work, gym here and there, Netflix, gaming sometimes, and wasting time online.",
-    "I’m 28. I guess I’m chill, a little sarcastic sometimes, but not hard to talk to if the vibe is right.",
-    "I’m 28, usually pretty reserved at first. I open up more when someone actually gives me a reason to.",
-    "I’m 28. Normal job, normal life, probably too much time on my phone at night.",
-    "I’m 28 and pretty simple. Work, food, gym sometimes, music, shows, and trying not to be bored.",
-    "I’m 28. I’m not the type to talk nonstop, but I can hold a conversation if it’s actually interesting.",
-    "I’m 28, kind of calm most of the time. I like people who don’t make everything feel fake.",
-    "I’m 28. I’m into cars, music, chill nights, and conversations that don’t feel copy pasted.",
-    "I’m 28. I’d say I’m pretty relaxed, maybe a little hard to impress at first.",
-    "I’m 28, just a regular guy. I work, come home tired, and look for something interesting to break the routine.",
-    "I’m 28. I don’t open up instantly, but I’m not cold if the vibe is good."
+    "I’m Ryan. What’s yours?",
+    "Ryan. Pretty normal name, nothing exciting.",
+    "My name’s Ryan. What should I call you?",
+    "Ryan. I don’t think I said that yet.",
+    "I’m Ryan, 28.",
+    "Ryan. Nice to meet you, I guess.",
+    "Name’s Ryan. What about you?",
+    "I’m Ryan. I’m not great at introductions, not gonna lie.",
+    "Ryan. You?",
+    "I’m Ryan. Simple enough."
   ];
 }
 
@@ -353,6 +337,51 @@ function ageReplies() {
   ];
 }
 
+function locationReplies() {
+  return [
+    "I’m from the New York area. Not exactly in the middle of everything, but close enough.",
+    "NY area. It’s busy, but I’m used to it.",
+    "I’m around New York. I like it sometimes, but it gets tiring.",
+    "New York area. Good food, too many people, same story.",
+    "I’m from NY. I like the city energy sometimes, but not every day.",
+    "Around New York. I’m more of a chill spot person than a crowded place person.",
+    "NY area. It’s alright, just expensive and loud sometimes.",
+    "I’m near New York. I like having stuff around, but I also like staying in.",
+    "New York side. Depends on the day if I love it or hate it.",
+    "I’m in the NY area. It’s a lot going on all the time."
+  ];
+}
+
+function moodReplies() {
+  return [
+    "I’ve been alright, just tired from work mostly. Nothing bad, just one of those slow weeks.",
+    "I’m good, just kind of low energy today. Work drained me a bit.",
+    "I’ve been okay. Not amazing, not terrible, just normal life stuff.",
+    "Pretty decent. I’m just relaxing now and trying to switch my brain off.",
+    "I’m alright. A little bored honestly, but not in a bad mood.",
+    "I’ve been good enough. Same routine mostly: work, eat, chill, repeat.",
+    "Not bad. Today was just slow, so I’m trying to find something interesting now.",
+    "I’m fine, just tired. I’m still here though.",
+    "I’ve been okay. I could use a better distraction tonight.",
+    "I’m alright. Nothing exciting happened, but maybe that’s not always bad."
+  ];
+}
+
+function relaxingReplies() {
+  return [
+    "Mostly just laying down, scrolling, and trying not to think about work. That’s my usual way to relax.",
+    "I usually relax by putting something on in the background and just scrolling for a bit. Nothing fancy.",
+    "Just chilling at home honestly. Music on, phone in hand, and trying to switch my brain off.",
+    "Usually I relax with a show, some music, or just doing absolutely nothing after work.",
+    "I’m relaxing by being lazy right now, pretty much. Sometimes that’s all I need after a long day.",
+    "Mostly just quiet time. I don’t always feel like talking to people after work unless the vibe is good.",
+    "I usually just get comfortable, put on Netflix or music, and scroll until I get bored.",
+    "Right now I’m just relaxing by laying around and checking my phone. Nothing exciting.",
+    "I like calm nights when I’m relaxing. Food, music, maybe a show, and no annoying people.",
+    "I guess relaxing for me is just not having to do anything for a while."
+  ];
+}
+
 function doingReplies() {
   return [
     "Not much honestly, just got home and I’m scrolling for a bit. Been kind of a slow day.",
@@ -364,12 +393,22 @@ function doingReplies() {
     "Just trying to turn my brain off for a bit. Work drained me today.",
     "Nothing crazy. I ate, got comfortable, and now I’m just passing time.",
     "I’m just relaxing. I should probably sleep earlier but I know I won’t.",
-    "Not doing much, which is kind of why I’m here.",
-    "Just laying around. I was bored enough to check my messages.",
-    "I’m kind of just floating between music, scrolling, and doing nothing.",
-    "Home right now, chilling. My energy is pretty low but I’m still awake.",
-    "Just finished some stuff and now I’m being lazy.",
-    "I’m just online for a bit, seeing if anything catches my attention."
+    "Not doing much, which is kind of why I’m here."
+  ];
+}
+
+function aboutReplies() {
+  return [
+    "I’m 28. Pretty normal guy honestly, work most days, gym sometimes, gaming or shows when I’m home.",
+    "I’m 28, nothing too crazy about me. I work, relax after, scroll too much, and talk when the vibe is decent.",
+    "I’m 28. I like cars, music, watching shows, and just chilling after work most nights.",
+    "I’m 28, pretty laid back. I’m not super loud or anything, I just like easy conversations that don’t feel forced.",
+    "I’m 28. Most of my life is work, gym here and there, Netflix, gaming sometimes, and wasting time online.",
+    "I’m 28. I guess I’m chill, a little sarcastic sometimes, but not hard to talk to if the vibe is right.",
+    "I’m 28, usually pretty reserved at first. I open up more when someone actually gives me a reason to.",
+    "I’m 28. Normal job, normal life, probably too much time on my phone at night.",
+    "I’m 28 and pretty simple. Work, food, gym sometimes, music, shows, and trying not to be bored.",
+    "I’m 28. I don’t open up instantly, but I’m not cold if the vibe is good."
   ];
 }
 
@@ -384,12 +423,7 @@ function hobbyReplies() {
     "I like late drives, good music, and easy conversations. Nothing too dramatic.",
     "I’m pretty simple. Gym if I have energy, shows if I don’t.",
     "Cars are probably one of the main things I actually get excited about.",
-    "I like relaxing more than being busy. Work already takes enough energy.",
-    "Music is always on for me. Helps me switch off a bit.",
-    "I like gaming, but more casually now. I don’t sweat every game like before.",
-    "Mostly things I can do without dealing with too many people.",
-    "I like quiet nights, food, music, and someone who can actually keep my attention.",
-    "I’m into normal stuff. I’m just picky with who I spend energy on."
+    "I like relaxing more than being busy. Work already takes enough energy."
   ];
 }
 
@@ -404,52 +438,7 @@ function workReplies() {
     "Yeah, work takes most of my energy. After that I don’t have patience for boring conversations.",
     "I work a regular job. It pays the bills, but I wouldn’t call it exciting.",
     "Yeah, I was working earlier. That’s why I’m moving kind of slow right now.",
-    "Work is work. Some days are fine, some days I just want to disappear after.",
-    "I do work, yeah. I’m usually more relaxed at night after I’m done.",
-    "Nothing fancy. I just try to get through the day and relax after.",
-    "Yeah, regular job. I’m not one of those people who loves talking about work.",
-    "I work, come home, eat, chill, repeat. Pretty much the routine.",
-    "I work enough that when I’m free, I want something that feels worth my attention."
-  ];
-}
-
-function locationReplies() {
-  return [
-    "I’m from the New York area. Not exactly in the middle of everything, but close enough.",
-    "NY area. It’s busy, but I’m used to it.",
-    "I’m around New York. I like it sometimes, but it gets tiring.",
-    "New York area. Good food, too many people, same story.",
-    "I’m from NY. I like the city energy sometimes, but not every day.",
-    "Around New York. I’m more of a chill spot person than a crowded place person.",
-    "NY area. It’s alright, just expensive and loud sometimes.",
-    "I’m near New York. I like having stuff around, but I also like staying in.",
-    "New York side. Depends on the day if I love it or hate it.",
-    "I’m in the NY area. It’s a lot going on all the time.",
-    "Around NY. I like it, but some days I want somewhere quieter.",
-    "New York area. You get used to the chaos after a while.",
-    "I’m from NY, but I’m not always in city mode.",
-    "NY area. It’s good if you like options, bad if you like peace.",
-    "Around New York. I’m more lowkey than the place is."
-  ];
-}
-
-function moodReplies() {
-  return [
-    "I’m alright, just a bit tired. Nothing bad happened, just one of those slow days.",
-    "Pretty okay. Not super energetic, but I’m here.",
-    "I’m fine, just kind of bored honestly.",
-    "Not bad. Work drained me a bit, so I’m just relaxing now.",
-    "I’m okay. Could be better, could be worse.",
-    "Chill mood mostly. A little tired but not in a bad way.",
-    "I’m decent. You caught me in a lazy mood.",
-    "I’m alright. I’m just waiting for something interesting to happen.",
-    "A little bored, but not in a bad mood.",
-    "I’m good enough. My social battery is half alive.",
-    "I’m okay. I just don’t feel like pretending to be super excited.",
-    "Kind of tired, kind of bored, but I’m still talking.",
-    "I’m relaxed. Maybe too relaxed honestly.",
-    "I’m fine. Just need someone to make the conversation less dry.",
-    "I’m alright, just seeing where this goes."
+    "Work is work. Some days are fine, some days I just want to disappear after."
   ];
 }
 
@@ -464,12 +453,7 @@ function relationshipReplies() {
     "I’m single. I like attention sometimes, but only when it feels real.",
     "Not seeing anyone seriously. I’m mostly just doing my own thing.",
     "Single. It takes me a bit to actually get interested though.",
-    "Yeah, single. I don’t open up super fast, but I’m not cold either.",
-    "I’m single. I guess I’m open to being interested, but I don’t force it.",
-    "Single for now. I’m not in a rush to deal with drama.",
-    "I’m single. I like flirting, but only if the person has a brain too.",
-    "Single. I get bored if someone only has looks and no vibe.",
-    "I’m single, but not desperate. There’s a difference."
+    "Yeah, single. I don’t open up super fast, but I’m not cold either."
   ];
 }
 
@@ -484,12 +468,7 @@ function interestReplies() {
     "I like when the conversation feels like it’s actually for me, not copy paste.",
     "Someone who knows how to build tension a little, not just rush everything.",
     "I get curious when someone gives me a reason to imagine more.",
-    "Honestly, effort. Not desperate effort, just real effort.",
-    "I like calm confidence. If someone is too pushy, I lose interest.",
-    "If it feels natural and a little personal, I pay attention more.",
-    "I like when someone can keep me guessing a bit.",
-    "A little mystery helps. Too much too fast gets boring.",
-    "I like when someone makes me feel like I’m not just another person in the inbox."
+    "Honestly, effort. Not desperate effort, just real effort."
   ];
 }
 
@@ -504,12 +483,7 @@ function whyHereReplies() {
     "Mostly boredom. If something catches my attention, I stay.",
     "I didn’t come with some big reason. Just curious, I guess.",
     "I wanted a distraction. Whether it’s good or not depends on the conversation.",
-    "I was just seeing if anything here felt different.",
-    "I guess I wanted something that didn’t feel like the same boring scroll.",
-    "I was curious enough to click, not convinced enough to stay forever.",
-    "Just bored, honestly. You get the chance to change that.",
-    "I came here because my night was boring. Simple as that.",
-    "I wanted to see if the vibe was actually worth my time."
+    "I was just seeing if anything here felt different."
   ];
 }
 
@@ -524,12 +498,7 @@ function onlineChatReplies() {
     "Online chat can be fun, but it gets boring when it’s too obvious.",
     "I like when someone makes it feel personal. Otherwise I just zone out.",
     "Sometimes yeah. I just don’t like feeling like I’m being handled by a script.",
-    "I can enjoy it if the other person knows how to build a vibe.",
-    "It depends. If it’s only small talk, I lose interest.",
-    "I like the idea of it, but the person needs to make it worth staying.",
-    "Yeah, but I need more than just ‘hey babe’ type energy.",
-    "It can be fun when it feels like there’s actual chemistry.",
-    "I’m open to it, but I need something to actually pull me in."
+    "I can enjoy it if the other person knows how to build a vibe."
   ];
 }
 
@@ -589,12 +558,7 @@ function complimentReplies() {
     "You’re trying, I respect it.",
     "That was actually kind of nice.",
     "Careful, you might make me think you know what you’re doing.",
-    "I’m skeptical, but I’ll accept it.",
-    "That was better than the usual lines people throw.",
-    "You’re not bad at this so far.",
-    "I’ll admit, that got my attention a bit.",
-    "Smooth, but I’m not convinced that easily.",
-    "Alright, that was cute."
+    "I’m skeptical, but I’ll accept it."
   ];
 }
 
@@ -614,12 +578,7 @@ function salesResistanceReplies() {
     "I don’t mind spending if I’m actually curious. I just hate feeling pushed.",
     "If it feels like the same offer everyone gets, I’ll probably pass.",
     "You have my attention a little, but not enough yet.",
-    "Maybe. Make me actually want it first.",
-    "I’m not saying no, I’m just not convinced yet.",
-    "I’d need to feel like it’s actually for me, not just another message.",
-    "Could be worth it, but you haven’t made me curious enough yet.",
-    "I don’t usually unlock things unless there’s some tension built up first.",
-    "If you can make it sound personal, maybe. Generic stuff doesn’t really work on me."
+    "Maybe. Make me actually want it first."
   ];
 }
 
@@ -670,6 +629,36 @@ function lowEffortReplies() {
     "I can’t really respond to nothing.",
     "You’re losing me a little there.",
     "Give me something better to react to."
+  ];
+}
+
+function greetingReplies(turn) {
+  if (turn <= 2) {
+    return [
+      "hey, what’s up",
+      "hey. I’m just chilling a bit right now",
+      "yo, pretty quiet here. what’s up",
+      "hey, just scrolling for a bit",
+      "hi, how’s it going",
+      "hey. long day but I’m around",
+      "what’s up, I’m just killing some time",
+      "hey, not doing much honestly",
+      "hi, I’m just relaxing right now",
+      "hey, kinda bored so I’m here for a bit"
+    ];
+  }
+
+  return [
+    "yeah I’m still here, just a bit distracted",
+    "I’m around, just scrolling between messages",
+    "yeah, what’s up",
+    "still here. just taking it easy",
+    "yeah I’m listening",
+    "I’m here, just waiting to see where you take this",
+    "yeah, you’ve got my attention for now",
+    "I’m still around. don’t make it boring though",
+    "yeah, go on",
+    "I’m here, just low energy"
   ];
 }
 
