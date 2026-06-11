@@ -1,7 +1,5 @@
 exports.handler = async function(event) {
   try {
-    console.log("Save assessment function started");
-
     if (event.httpMethod !== "POST") {
       return json(405, { error: "Method not allowed" });
     }
@@ -10,14 +8,8 @@ exports.handler = async function(event) {
     const supabaseKey = process.env.SUPABASE_SECRET_KEY;
     const geminiKey = process.env.GEMINI_API_KEY;
 
-    if (!supabaseUrl) {
-      console.log("Missing SUPABASE_URL");
-      return json(500, { error: "Missing SUPABASE_URL" });
-    }
-
-    if (!supabaseKey) {
-      console.log("Missing SUPABASE_SECRET_KEY");
-      return json(500, { error: "Missing SUPABASE_SECRET_KEY" });
+    if (!supabaseUrl || !supabaseKey) {
+      return json(500, { error: "Missing Supabase environment variables" });
     }
 
     const body = JSON.parse(event.body || "{}");
@@ -26,41 +18,23 @@ exports.handler = async function(event) {
     const candidate_email = String(body.candidate_email || "").trim();
     const transcript = Array.isArray(body.transcript) ? body.transcript : [];
 
-    console.log("Candidate:", candidate_name, candidate_email);
-    console.log("Transcript messages:", transcript.length);
-
-    if (!candidate_name || !candidate_email) {
-      return json(400, { error: "Missing candidate name or email" });
+    if (!candidate_name || !candidate_email || transcript.length === 0) {
+      return json(400, { error: "Missing candidate name, email, or transcript" });
     }
 
-    if (!transcript.length) {
-      return json(400, { error: "Transcript is empty" });
-    }
+    let evaluation = null;
 
-    let evaluation = {
-      grammar_score: null,
-      engagement_score: null,
-      conversation_flow_score: null,
-      sales_skill_score: null,
-      flirting_teasing_score: null,
-      objection_handling_score: null,
-      personalization_score: null,
-      overall_score: null,
-      recommendation: "Manual Review",
-      strengths: [],
-      weaknesses: [],
-      manager_notes: "Transcript saved. Manual review recommended."
-    };
-
+    // 1. Main evaluation: Gemini
     if (geminiKey) {
-      const aiEvaluation = await evaluateTranscriptWithGemini(geminiKey, transcript);
-
-      if (aiEvaluation) {
-        evaluation = aiEvaluation;
-      }
+      evaluation = await evaluateTranscriptWithGemini(geminiKey, transcript);
     }
 
-    const score = Number(evaluation.overall_score) || null;
+    // 2. Backup evaluation: only if Gemini fails
+    if (!evaluation || !evaluation.overall_score) {
+      evaluation = generateAutomaticBackupReview(transcript);
+    }
+
+    const score = Number(evaluation.overall_score || 0) || null;
 
     const payload = {
       candidate_name,
@@ -70,89 +44,109 @@ exports.handler = async function(event) {
       score
     };
 
-    console.log("Sending to Supabase...");
-
     const res = await fetch(`${supabaseUrl}/rest/v1/assessments`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "apikey": supabaseKey,
-        "Authorization": `Bearer ${supabaseKey}`,
-        "Prefer": "return=representation"
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        Prefer: "return=representation"
       },
       body: JSON.stringify(payload)
     });
 
-    const text = await res.text();
-
-    console.log("Supabase status:", res.status);
-    console.log("Supabase response:", text);
+    const data = await res.json();
 
     if (!res.ok) {
-      return json(500, {
-        error: "Supabase insert failed",
-        status: res.status,
-        details: text
-      });
-    }
-
-    let data = null;
-
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = text;
+      console.log("Supabase insert error:", JSON.stringify(data));
+      return json(500, { error: data.message || "Supabase insert failed" });
     }
 
     return json(200, {
       saved: true,
-      assessment: Array.isArray(data) ? data[0] : data
+      assessment: data[0]
     });
 
   } catch (err) {
-    console.log("Save function error:", err.message);
+    console.log("Save assessment error:", err.message);
     return json(500, { error: err.message });
   }
 };
 
+function json(statusCode, body) {
+  return {
+    statusCode,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  };
+}
+
+/* ---------------- GEMINI REVIEW - MAIN EVALUATION ---------------- */
+
 async function evaluateTranscriptWithGemini(apiKey, transcript) {
   try {
     const conversation = transcript
-      .map(m => `${m.role === "fan" ? "Fan/Ryan" : "Candidate"}: ${m.text}`)
+      .map(m => `${m.role === "fan" ? "Fan" : "Candidate"}: ${m.text}`)
       .join("\n");
 
     const prompt = `
-You are evaluating a hiring candidate for an online chat sales role.
+You are evaluating a hiring candidate for a chat sales role.
 
-Evaluate ONLY the candidate's messages.
-Do NOT evaluate Ryan/the fan.
-The candidate's job is to keep conversation active, write well, build rapport, flirt/tease when appropriate, create curiosity, handle objections, and sell naturally without being too pushy.
+Evaluate ONLY the Candidate messages.
+Do NOT evaluate the Fan messages.
 
-Return VALID JSON ONLY.
-No markdown.
-No explanation outside JSON.
+The candidate is being tested on:
+- English grammar
+- Natural conversation
+- Engagement
+- Creativity
+- Ability to lead the chat
+- Flirting and teasing
+- Ability to build curiosity
+- Sales skill
+- Objection handling
+- Personalization
+- Not sounding robotic
+- Not being too pushy
 
-Use this exact structure:
+Important:
+Return ONLY valid JSON.
+Do not use markdown.
+Do not use code blocks.
+Do not write explanations outside the JSON.
+
+Use this exact JSON structure:
+
 {
-  "grammar_score": 1-10,
-  "engagement_score": 1-10,
-  "conversation_flow_score": 1-10,
-  "sales_skill_score": 1-10,
-  "flirting_teasing_score": 1-10,
-  "objection_handling_score": 1-10,
-  "personalization_score": 1-10,
-  "overall_score": 1-10,
-  "recommendation": "Hire" or "Maybe" or "Reject",
-  "strengths": ["short point", "short point", "short point"],
-  "weaknesses": ["short point", "short point", "short point"],
-  "manager_notes": "short practical summary for the manager"
+  "grammar_score": 1,
+  "engagement_score": 1,
+  "conversation_flow_score": 1,
+  "sales_skill_score": 1,
+  "flirting_teasing_score": 1,
+  "objection_handling_score": 1,
+  "personalization_score": 1,
+  "overall_score": 1,
+  "recommendation": "Hire",
+  "strengths": ["strength 1", "strength 2"],
+  "weaknesses": ["weakness 1", "weakness 2"],
+  "manager_notes": "short practical summary for the manager",
+  "evaluation_source": "Gemini AI Review"
 }
 
-Scoring guidance:
+Scoring rules:
 - 1-3 = weak
-- 4-6 = average / needs training
+- 4-6 = average
 - 7-8 = good
 - 9-10 = excellent
+
+Recommendation rules:
+- Hire = strong candidate, good English, good flow, can sell naturally
+- Maybe = has potential but needs training
+- Reject = weak English, bad flow, robotic, or poor sales ability
+
+Be strict but fair.
+If the candidate has bad grammar, awkward English, or robotic conversation, lower the score.
+If the candidate leads the conversation well, asks good questions, flirts naturally, creates curiosity, and sells smoothly, give a higher score.
 
 Conversation:
 ${conversation}
@@ -173,8 +167,8 @@ ${conversation}
           }
         ],
         generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: 1000
+          temperature: 0.15,
+          maxOutputTokens: 1200
         }
       })
     });
@@ -186,27 +180,46 @@ ${conversation}
       return null;
     }
 
-    const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const cleaned = raw
-      .replace(/```json/gi, "")
-      .replace(/```/g, "")
-      .trim();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-    try {
-      const parsed = JSON.parse(cleaned);
-      return sanitizeEvaluation(parsed);
-    } catch (err) {
-      console.log("Could not parse Gemini evaluation:", raw);
+    const parsed = parseJsonFromText(text);
+
+    if (!parsed) {
+      console.log("Could not parse Gemini evaluation:", text);
       return null;
     }
 
+    return normalizeEvaluation(parsed, "Gemini AI Review");
+
   } catch (err) {
-    console.log("Evaluation function error:", err.message);
+    console.log("Gemini evaluation function error:", err.message);
     return null;
   }
 }
 
-function sanitizeEvaluation(evaluation) {
+function parseJsonFromText(text) {
+  try {
+    const cleaned = String(text || "")
+      .replace(/```json/gi, "")
+      .replace(/```/g, "")
+      .trim();
+
+    const firstBrace = cleaned.indexOf("{");
+    const lastBrace = cleaned.lastIndexOf("}");
+
+    if (firstBrace === -1 || lastBrace === -1) {
+      return null;
+    }
+
+    const jsonText = cleaned.slice(firstBrace, lastBrace + 1);
+    return JSON.parse(jsonText);
+
+  } catch (err) {
+    return null;
+  }
+}
+
+function normalizeEvaluation(evaluation, source) {
   return {
     grammar_score: clampScore(evaluation.grammar_score),
     engagement_score: clampScore(evaluation.engagement_score),
@@ -216,29 +229,165 @@ function sanitizeEvaluation(evaluation) {
     objection_handling_score: clampScore(evaluation.objection_handling_score),
     personalization_score: clampScore(evaluation.personalization_score),
     overall_score: clampScore(evaluation.overall_score),
-    recommendation: ["Hire", "Maybe", "Reject"].includes(evaluation.recommendation)
-      ? evaluation.recommendation
-      : "Manual Review",
-    strengths: Array.isArray(evaluation.strengths) ? evaluation.strengths.slice(0, 5) : [],
-    weaknesses: Array.isArray(evaluation.weaknesses) ? evaluation.weaknesses.slice(0, 5) : [],
-    manager_notes: String(evaluation.manager_notes || "Manual review recommended.")
+    recommendation: normalizeRecommendation(evaluation.recommendation),
+    strengths: normalizeArray(evaluation.strengths),
+    weaknesses: normalizeArray(evaluation.weaknesses),
+    manager_notes: String(evaluation.manager_notes || "No manager notes provided.").trim(),
+    evaluation_source: source
   };
 }
 
 function clampScore(value) {
   const num = Number(value);
-  if (!Number.isFinite(num)) return null;
-  if (num < 1) return 1;
-  if (num > 10) return 10;
-  return Math.round(num * 10) / 10;
+  if (!Number.isFinite(num)) return 1;
+  return Math.max(1, Math.min(10, Math.round(num)));
 }
 
-function json(statusCode, body) {
+function normalizeRecommendation(value) {
+  const text = String(value || "").toLowerCase();
+
+  if (text.includes("hire")) return "Hire";
+  if (text.includes("maybe")) return "Maybe";
+  if (text.includes("reject")) return "Reject";
+
+  return "Maybe";
+}
+
+function normalizeArray(value) {
+  if (Array.isArray(value)) {
+    return value.map(v => String(v)).filter(Boolean).slice(0, 5);
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    return [value.trim()];
+  }
+
+  return [];
+}
+
+/* ---------------- AUTOMATIC BACKUP REVIEW - ONLY IF GEMINI FAILS ---------------- */
+
+function generateAutomaticBackupReview(transcript) {
+  const candidateMessages = transcript
+    .filter(m => m.role === "candidate")
+    .map(m => String(m.text || ""));
+
+  const text = candidateMessages.join(" ").toLowerCase();
+
+  const messageCount = candidateMessages.length;
+  const totalWords = text.split(/\s+/).filter(Boolean).length;
+  const avgWords = messageCount ? totalWords / messageCount : 0;
+
+  const questionCount = (text.match(/\?/g) || []).length;
+
+  const salesWords = countMatches(text, [
+    "buy", "unlock", "vip", "secret", "special", "video", "content",
+    "premium", "offer", "deal", "tip", "send", "ppv", "exclusive",
+    "private", "surprise", "limited"
+  ]);
+
+  const flirtyWords = countMatches(text, [
+    "baby", "babe", "cute", "sexy", "kiss", "tease", "miss",
+    "want", "touch", "naughty", "dirty", "wet", "hot"
+  ]);
+
+  const personalizationWords = countMatches(text, [
+    "you", "your", "about you", "what do you", "tell me", "how about",
+    "what are you", "do you like"
+  ]);
+
+  const pushyWords = countMatches(text, [
+    "buy now", "right now", "pay now", "hurry", "prove it",
+    "stop wasting", "you have to"
+  ]);
+
+  let grammar_score = 6;
+  let engagement_score = 5;
+  let conversation_flow_score = 5;
+  let sales_skill_score = 4;
+  let flirting_teasing_score = 4;
+  let objection_handling_score = 4;
+  let personalization_score = 5;
+
+  if (avgWords >= 8) engagement_score += 1;
+  if (avgWords >= 14) conversation_flow_score += 1;
+
+  if (questionCount >= 5) engagement_score += 1;
+  if (questionCount >= 10) personalization_score += 1;
+
+  if (salesWords >= 3) sales_skill_score += 2;
+  if (salesWords >= 7) sales_skill_score += 1;
+
+  if (flirtyWords >= 4) flirting_teasing_score += 2;
+  if (flirtyWords >= 10) flirting_teasing_score += 1;
+
+  if (personalizationWords >= 15) personalization_score += 2;
+
+  if (pushyWords >= 2) {
+    sales_skill_score -= 2;
+    conversation_flow_score -= 1;
+  }
+
+  if (messageCount >= 50) {
+    engagement_score += 1;
+    conversation_flow_score += 1;
+  }
+
+  grammar_score = clampScore(grammar_score);
+  engagement_score = clampScore(engagement_score);
+  conversation_flow_score = clampScore(conversation_flow_score);
+  sales_skill_score = clampScore(sales_skill_score);
+  flirting_teasing_score = clampScore(flirting_teasing_score);
+  objection_handling_score = clampScore(objection_handling_score);
+  personalization_score = clampScore(personalization_score);
+
+  const overall_score = clampScore(
+    (
+      grammar_score +
+      engagement_score +
+      conversation_flow_score +
+      sales_skill_score +
+      flirting_teasing_score +
+      objection_handling_score +
+      personalization_score
+    ) / 7
+  );
+
+  let recommendation = "Maybe";
+  if (overall_score >= 8) recommendation = "Hire";
+  if (overall_score <= 4) recommendation = "Reject";
+
   return {
-    statusCode,
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
+    grammar_score,
+    engagement_score,
+    conversation_flow_score,
+    sales_skill_score,
+    flirting_teasing_score,
+    objection_handling_score,
+    personalization_score,
+    overall_score,
+    recommendation,
+    strengths: [
+      "Candidate completed the chat assessment.",
+      "Candidate maintained activity throughout the conversation."
+    ],
+    weaknesses: [
+      "Gemini AI review was not available for this assessment.",
+      "This is an automatic backup review, so the manager should manually verify the transcript."
+    ],
+    manager_notes: "Automatic backup review was used because Gemini AI review failed or did not return valid JSON. Manager should manually check the transcript before making a final hiring decision.",
+    evaluation_source: "Automatic Backup Review"
   };
+}
+
+function countMatches(text, words) {
+  let count = 0;
+
+  for (const word of words) {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`\\b${escaped}\\b`, "gi");
+    count += (text.match(regex) || []).length;
+  }
+
+  return count;
 }
